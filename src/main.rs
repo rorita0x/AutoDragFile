@@ -1,124 +1,235 @@
+mod config;
+
+use clap::Parser;
+use config::{Config, DEFAULT_CONFIG};
+use gtk::cairo::{RectangleInt, Region};
 use gtk::prelude::*;
-use gtk::{gdk, glib, Label, TargetList, Window, WindowType};
+use gtk::{gdk, glib, CssProvider, EventBox, Fixed, Label, TargetList, Window, WindowType};
+use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::cell::Cell;
-use std::env;
-use std::path::PathBuf;
-use std::process::{self, Command};
+use std::path::{Path, PathBuf};
+use std::process;
 use std::rc::Rc;
+use std::time::Duration;
+
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Spawns a small box under the cursor from which FILE can be dragged"
+)]
+struct Cli {
+    #[arg(
+        short,
+        long,
+        value_name = "PATH",
+        help = "TOML file overriding texts, colours and timings"
+    )]
+    config: Option<PathBuf>,
+
+    #[arg(
+        long,
+        exclusive = true,
+        help = "Print the default config to stdout and exit"
+    )]
+    print_default_config: bool,
+
+    #[arg(required_unless_present = "print_default_config")]
+    file: Option<PathBuf>,
+}
 
 fn main() {
-    // 1. Argument Handling
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Nutzung: cargo run -- /pfad/zur/datei");
-        process::exit(1);
+    let cli = Cli::parse();
+
+    if cli.print_default_config {
+        print!("{DEFAULT_CONFIG}");
+        return;
     }
 
-    let filepath = PathBuf::from(&args[1]);
+    let config = Config::load(cli.config.as_deref()).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        process::exit(1);
+    });
+
+    let filepath = cli.file.expect("clap enforces FILE");
     if !filepath.is_file() {
-        eprintln!("Datei existiert nicht: {}", filepath.display());
+        eprintln!(
+            "{}",
+            config.text.file_not_found.replace("{path}", &filepath.display().to_string())
+        );
         process::exit(1);
     }
 
-    // 2. Initialize GTK
     if gtk::init().is_err() {
-        eprintln!("Fehler bei der Initialisierung von GTK.");
+        eprintln!("{}", config.text.gtk_init_failed);
         process::exit(1);
     }
 
-    // 3. Window Setup
+    let css = CssProvider::new();
+    if let Err(e) = css.load_from_data(config.css().as_bytes()) {
+        eprintln!("Invalid style config: {e}");
+        process::exit(1);
+    }
+    gtk::StyleContext::add_provider_for_screen(
+        &gdk::Screen::default().expect("GTK is initialised"),
+        &css,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
+    let drag_box = build_drag_box(&config);
+    let drag_started = Rc::new(Cell::new(false));
+    setup_drag_source(&drag_box, &filepath, drag_started.clone(), &config);
+
+    let window = if gtk_layer_shell::is_supported() {
+        build_layer_overlay(&config, &drag_box)
+    } else {
+        build_x11_window(&config, &drag_box)
+    };
+    window.connect_destroy(|_| gtk::main_quit());
+
+    let timeout_reached = config.text.timeout_reached.clone();
+    glib::timeout_add_local_once(Duration::from_millis(config.behavior.timeout_ms), move || {
+        if !drag_started.get() {
+            println!("{timeout_reached}");
+            gtk::main_quit();
+        }
+    });
+
+    gtk::main();
+}
+
+fn build_drag_box(config: &Config) -> EventBox {
+    let label = Label::new(None);
+    label.set_markup(&config.text.label);
+
+    let drag_box = EventBox::new();
+    drag_box.style_context().add_class("drag-box");
+    drag_box.set_size_request(config.style.width, config.style.height);
+    drag_box.add(&label);
+    drag_box
+}
+
+fn setup_drag_source(
+    drag_box: &EventBox,
+    filepath: &Path,
+    drag_started: Rc<Cell<bool>>,
+    config: &Config,
+) {
+    let targets = TargetList::new(&[]);
+    targets.add_uri_targets(0);
+    drag_box.drag_source_set(gdk::ModifierType::BUTTON1_MASK, &[], gdk::DragAction::COPY);
+    drag_box.drag_source_set_target_list(Some(&targets));
+
+    let filepath = filepath.to_path_buf();
+    drag_box.connect_drag_data_get(move |_, _, data, _, _| {
+        if let Ok(uri) = filepath
+            .canonicalize()
+            .map_err(|_| ())
+            .and_then(|abs| glib::filename_to_uri(&abs, None).map_err(|_| ()))
+        {
+            data.set_uris(&[&uri]);
+        }
+    });
+
+    drag_box.connect_drag_begin(move |_, _| drag_started.set(true));
+
+    let drag_finished = config.text.drag_finished.clone();
+    drag_box.connect_drag_end(move |_, _| {
+        println!("{drag_finished}");
+        gtk::main_quit();
+    });
+}
+
+fn new_transparent_window(config: &Config) -> Window {
     let window = Window::new(WindowType::Toplevel);
-    window.set_title("Drag Datei");
+    window.set_title(&config.text.window_title);
+    window.set_app_paintable(true);
+    window.style_context().add_class("transparent");
+    if let Some(visual) = WidgetExt::screen(&window).and_then(|s| s.rgba_visual()) {
+        window.set_visual(Some(&visual));
+    }
+    window
+}
+
+fn build_layer_overlay(config: &Config, drag_box: &EventBox) -> Window {
+    let window = new_transparent_window(config);
+    window.init_layer_shell();
+    window.set_namespace("autodragfile");
+    window.set_layer(Layer::Overlay);
+    window.set_keyboard_mode(KeyboardMode::None);
+    window.set_exclusive_zone(-1);
+    for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+        window.set_anchor(edge, true);
+    }
+
+    let fixed = Fixed::new();
+    fixed.put(drag_box, 0, 0);
+    window.add(&fixed);
+    window.add_events(gdk::EventMask::POINTER_MOTION_MASK | gdk::EventMask::ENTER_NOTIFY_MASK);
+
+    let placed = Rc::new(Cell::new(false));
+    let place_at_cursor = {
+        let window = window.clone();
+        let drag_box = drag_box.clone();
+        let (offset_x, offset_y) = (config.behavior.offset_x, config.behavior.offset_y);
+        move |(cursor_x, cursor_y): (f64, f64)| {
+            if placed.replace(true) {
+                return;
+            }
+            drag_box.show();
+            let (_, natural) = drag_box.preferred_size();
+            let x = (cursor_x as i32 + offset_x).clamp(0, (window.allocated_width() - natural.width).max(0));
+            let y = (cursor_y as i32 + offset_y).clamp(0, (window.allocated_height() - natural.height).max(0));
+            fixed.move_(&drag_box, x, y);
+            window.input_shape_combine_region(Some(&Region::create_rectangle(&RectangleInt::new(
+                x,
+                y,
+                natural.width,
+                natural.height,
+            ))));
+        }
+    };
+    let place_on_motion = place_at_cursor.clone();
+    window.connect_enter_notify_event(move |_, event| {
+        place_at_cursor(event.position());
+        glib::Propagation::Proceed
+    });
+    window.connect_motion_notify_event(move |_, event| {
+        place_on_motion(event.position());
+        glib::Propagation::Proceed
+    });
+
+    let win = window.clone();
+    drag_box.connect_drag_begin(move |drag_box, _| {
+        drag_box.set_opacity(0.0);
+        win.input_shape_combine_region(Some(&Region::create()));
+    });
+
+    window.show_all();
+    drag_box.hide();
+    window
+}
+
+fn build_x11_window(config: &Config, drag_box: &EventBox) -> Window {
+    let window = new_transparent_window(config);
     window.set_decorated(false);
     window.set_keep_above(true);
     window.set_resizable(false);
-    window.set_app_paintable(true);
-    window.set_default_size(100, 40);
-    window.set_border_width(8);
+    window.add(drag_box);
 
-    let label = Label::new(None);
-    label.set_markup("<span foreground=\"white\" font_weight=\"bold\">📎 Datei ziehen</span>");
-    window.add(&label);
+    let pointer = gdk::Display::default()
+        .and_then(|d| d.default_seat())
+        .and_then(|s| s.pointer());
+    if let Some(pointer) = pointer {
+        let (_, x, y) = pointer.position();
+        window.move_(x + config.behavior.offset_x, y + config.behavior.offset_y);
+    }
 
-    // 4. Drag & Drop Setup
-    let targets = TargetList::new(&[]);
-    targets.add_uri_targets(0);
-
-    window.drag_source_set(gdk::ModifierType::BUTTON1_MASK, &[], gdk::DragAction::COPY);
-    window.drag_source_set_target_list(Some(&targets));
-
-    let drag_started = Rc::new(Cell::new(false));
-
-    // 5. Signals
-    let filepath_clone = filepath.clone();
-    window.connect_drag_data_get(move |_, _, data, _, _| {
-        if let Ok(abs_path) = filepath_clone.canonicalize() {
-            // Safely encode the absolute path into a file:// URI
-            if let Ok(uri) = glib::filename_to_uri(&abs_path, None) {
-                data.set_uris(&[&uri.to_string()]);
-            }
+    drag_box.connect_drag_begin(move |drag_box, _| {
+        if let Some(toplevel) = drag_box.toplevel() {
+            toplevel.hide();
         }
     });
 
-    let drag_started_clone = drag_started.clone();
-    window.connect_drag_begin(move |win, _| {
-        drag_started_clone.set(true);
-        win.hide();
-    });
-
-    window.connect_drag_end(|_, _| {
-        println!("Drag beendet. Schließe Anwendung.");
-        gtk::main_quit();
-    });
-
-    window.connect_destroy(|_| {
-        gtk::main_quit();
-    });
-
-    // 6. Move under mouse (Idle task)
-    let win_clone = window.clone();
-    glib::idle_add_local(move || {
-        if let Ok(output) = Command::new("xdotool")
-            .args(["getmouselocation", "--shell"])
-            .output()
-            {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut x = 0;
-                let mut y = 0;
-
-                for line in stdout.lines() {
-                    let parts: Vec<&str> = line.split('=').collect();
-                    if parts.len() == 2 {
-                        match parts[0] {
-                            "X" => x = parts[1].parse().unwrap_or(0),
-                         "Y" => y = parts[1].parse().unwrap_or(0),
-                         _ => {}
-                        }
-                    }
-                }
-                // `move_` is used instead of `move` because `move` is a reserved keyword in Rust
-                win_clone.move_(x - 50, y - 20);
-            } else {
-                eprintln!("Fehler bei Mausposition: xdotool fehlgeschlagen/nicht installiert.");
-            }
-
-            // Return Break to ensure this only runs once
-            glib::ControlFlow::Break
-    });
-
-    // 7. Safety Timeout
-    let drag_started_timeout = drag_started.clone();
-    glib::timeout_add_seconds_local(3, move || {
-        if !drag_started_timeout.get() {
-            println!("Kein Drag erkannt – beende Prozess (Safety-Timeout).");
-            gtk::main_quit();
-        }
-
-        // Return Break to end the timeout
-        glib::ControlFlow::Break
-    });
-
-    // 8. Start
     window.show_all();
-    gtk::main();
+    window
 }

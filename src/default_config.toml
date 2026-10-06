@@ -1,0 +1,33 @@
+# AutoDragFile configuration
+#
+# Every key is optional: values left out of your own config fall back to
+# the defaults shown here.
+
+[text]
+# Pango markup is allowed, e.g. "<i>Drag me</i>".
+label = "📎 Datei ziehen"
+window_title = "Drag Datei"
+drag_finished = "Drag beendet. Schließe Anwendung."
+timeout_reached = "Kein Drag erkannt – beende Prozess (Safety-Timeout)."
+# {path} is replaced with the given file path.
+file_not_found = "Datei existiert nicht: {path}"
+gtk_init_failed = "Fehler bei der Initialisierung von GTK."
+
+[style]
+# Colours accept any CSS colour: names, #rrggbb, rgb(), rgba().
+foreground = "white"
+background = "rgba(30, 30, 30, 0.9)"
+font_weight = "bold"
+font_size = "11pt"
+# Sizes in pixels.
+padding = 8
+border_radius = 6
+width = 100
+height = 40
+
+[behavior]
+# Exit after this many milliseconds if no drag was started.
+timeout_ms = 3000
+# Position of the box's top-left corner relative to the cursor.
+offset_x = -50
+offset_y = -20
