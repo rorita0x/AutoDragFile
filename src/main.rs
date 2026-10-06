@@ -116,8 +116,21 @@ fn setup_drag_source(
 ) {
     let targets = TargetList::new(&[]);
     targets.add_uri_targets(0);
-    drag_box.drag_source_set(gdk::ModifierType::BUTTON1_MASK, &[], gdk::DragAction::COPY);
-    drag_box.drag_source_set_target_list(Some(&targets));
+    drag_box.connect_button_press_event(move |drag_box, press| {
+        if press.button() != 1 {
+            return glib::Propagation::Proceed;
+        }
+        let (x, y) = press.position();
+        drag_box.drag_begin_with_coordinates(
+            &targets,
+            gdk::DragAction::COPY,
+            1,
+            Some(press),
+            x as i32,
+            y as i32,
+        );
+        glib::Propagation::Stop
+    });
 
     let filepath = filepath.to_path_buf();
     drag_box.connect_drag_data_get(move |_, _, data, _, _| {
